@@ -71,14 +71,18 @@ def save_reminders(data):
 
 # ---- Claude parsing: payment messages (Models payments topic) ----
 
-PARSE_PAYMENT_PROMPT = """You extract payment data from a message. The message will contain some
-combination of: a model's name, a date, a "chatting cost" amount, and an amount the model
-sent (e.g. "sent Jake"). Formats vary slightly.
+PARSE_PAYMENT_PROMPT = """You extract money-related info from a message posted in a payments log chat.
+Messages could be in many formats — structured ("Chatting cost: 200 / Maddie sent Jake: 1500"),
+a single line ("Kai sent 3000"), a note ("Maddie owes 38292"), or "Ethan got 200$".
 
 Return ONLY a JSON object, no other text, no markdown fences, in this exact shape:
-{{"model": "<name or null>", "date": "<date as written or null>", "chatting_cost": <number or null>, "amount_sent": <number or null>}}
+{{"is_money_related": true/false, "model": "<name or null>", "date": "<date as written, or null if not mentioned>", "chatting_cost": <number or null>, "amount_sent": <number or null>, "note": "<short plain description of what happened, always fill this in if is_money_related is true>"}}
 
-If the message does not contain payment data at all, return {{"model": null, "date": null, "chatting_cost": null, "amount_sent": null}}
+Rules:
+- is_money_related is true for ANY message describing a payment, amount owed, amount received, or similar — even a single line with just a name and a number.
+- chatting_cost and amount_sent are only for those SPECIFIC concepts. If the message doesn't mention one of them, leave it null — do not guess.
+- note should always be filled in when is_money_related is true, in plain English, e.g. "Maddie owes 38292", "Kai sent 3000", "Ethan received 200".
+- If the message is unrelated to money entirely (a greeting, a test, banter), return is_money_related: false and note: null.
 
 Message:
 {message}
@@ -96,7 +100,7 @@ def parse_payment_message(text: str):
     except Exception:
         logger.exception("Failed to parse payment message")
         return None
-    if data.get("chatting_cost") is None or data.get("amount_sent") is None:
+    if not data.get("is_money_related"):
         return None
     return data
 
@@ -139,12 +143,18 @@ async def handle_payment_message(update: Update, text: str):
     parsed = parse_payment_message(text)
     logger.info("Parsed payment result: %s", parsed)
     if not parsed:
-        return  # not a payment message, ignore silently
+        return  # not money-related, ignore silently
 
-    chatting_cost = float(parsed["chatting_cost"])
-    amount_sent = float(parsed["amount_sent"])
-    total_after = round(amount_sent - chatting_cost, 2)
-    ethan_share = round(total_after * COMMISSION_SPLIT, 2)
+    chatting_cost = parsed.get("chatting_cost")
+    amount_sent = parsed.get("amount_sent")
+    chatting_cost = float(chatting_cost) if chatting_cost is not None else None
+    amount_sent = float(amount_sent) if amount_sent is not None else None
+
+    total_after = None
+    ethan_share = None
+    if chatting_cost is not None and amount_sent is not None:
+        total_after = round(amount_sent - chatting_cost, 2)
+        ethan_share = round(total_after * COMMISSION_SPLIT, 2)
 
     entry = {
         "model": parsed.get("model"),
@@ -153,6 +163,8 @@ async def handle_payment_message(update: Update, text: str):
         "amount_sent": amount_sent,
         "total_after_chatting": total_after,
         "ethan_share": ethan_share,
+        "note": parsed.get("note"),
+        "raw_text": text,
         "logged_at": datetime.now().isoformat(),
         "month": datetime.now().strftime("%Y-%m"),
     }
@@ -161,14 +173,19 @@ async def handle_payment_message(update: Update, text: str):
     payments.append(entry)
     save_payments(payments)
 
-    reply = (
-        f"Logged \u2705\n"
-        f"Chatting cost: {chatting_cost:.2f}\n"
-        f"{'Sent Jake' if not entry['model'] else entry['model'] + ' sent Jake'}: {amount_sent:.2f}\n"
-        f"Total after chatting: {total_after:.2f}\n"
-        f"Ethan share: {ethan_share:.2f}"
-    )
-    await update.message.reply_text(reply, message_thread_id=PAYMENTS_THREAD_ID)
+    lines = ["Logged \u2705"]
+    if parsed.get("note"):
+        lines.append(parsed["note"])
+    if chatting_cost is not None:
+        lines.append(f"Chatting cost: {chatting_cost:.2f}")
+    if amount_sent is not None:
+        sender_label = f"{entry['model']} sent Jake" if entry.get("model") else "Sent Jake"
+        lines.append(f"{sender_label}: {amount_sent:.2f}")
+    if total_after is not None:
+        lines.append(f"Total after chatting: {total_after:.2f}")
+        lines.append(f"Ethan share: {ethan_share:.2f}")
+
+    await update.message.reply_text("\n".join(lines), message_thread_id=PAYMENTS_THREAD_ID)
 
 # ---- Telegram handlers: @ mention (expense log / reminder / report query) ----
 
@@ -248,10 +265,10 @@ def build_range_report(start_date: str, end_date: str) -> str:
     p_in_range = [p for p in payments if in_range(p["logged_at"])]
     e_in_range = [e for e in expenses if in_range(e["logged_at"])]
 
-    total_chatting = sum(p["chatting_cost"] for p in p_in_range)
-    total_sent = sum(p["amount_sent"] for p in p_in_range)
-    total_after = sum(p["total_after_chatting"] for p in p_in_range)
-    total_share = sum(p["ethan_share"] for p in p_in_range)
+    total_chatting = sum(p["chatting_cost"] for p in p_in_range if p.get("chatting_cost") is not None)
+    total_sent = sum(p["amount_sent"] for p in p_in_range if p.get("amount_sent") is not None)
+    total_after = sum(p["total_after_chatting"] for p in p_in_range if p.get("total_after_chatting") is not None)
+    total_share = sum(p["ethan_share"] for p in p_in_range if p.get("ethan_share") is not None)
     total_expenses = sum(e["amount"] for e in e_in_range)
 
     lines = [f"Report: {start_date} to {end_date}", ""]
@@ -318,7 +335,8 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"Removed {len(removed)} payment entry(ies):"]
     for entry in removed:
-        lines.append(f"- {entry['date']}: chatting cost {entry['chatting_cost']:.2f}, sent {entry['amount_sent']:.2f}")
+        detail = entry.get("note") or entry.get("raw_text") or "entry"
+        lines.append(f"- {entry['date']}: {detail}")
     await update.message.reply_text("\n".join(lines), message_thread_id=PAYMENTS_THREAD_ID)
 
 async def undo_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,13 +392,18 @@ def build_monthly_report(month: str) -> str:
     total_share = 0.0
     for p in payments:
         lines.append(f"{p['date']}")
-        lines.append(f"Chatting cost: {p['chatting_cost']:.2f}")
-        sender = f"{p['model']} sent Jake" if p.get("model") else "Sent Jake"
-        lines.append(f"{sender}: {p['amount_sent']:.2f}")
-        lines.append(f"Total after chatting: {p['total_after_chatting']:.2f}")
-        lines.append(f"Ethan share: {p['ethan_share']:.2f}")
+        if p.get("note"):
+            lines.append(p["note"])
+        if p.get("chatting_cost") is not None:
+            lines.append(f"Chatting cost: {p['chatting_cost']:.2f}")
+        if p.get("amount_sent") is not None:
+            sender = f"{p['model']} sent Jake" if p.get("model") else "Sent Jake"
+            lines.append(f"{sender}: {p['amount_sent']:.2f}")
+        if p.get("total_after_chatting") is not None:
+            lines.append(f"Total after chatting: {p['total_after_chatting']:.2f}")
+            lines.append(f"Ethan share: {p['ethan_share']:.2f}")
+            total_share += p["ethan_share"]
         lines.append("")
-        total_share += p["ethan_share"]
 
     lines.append(f"Total Ethan share: {total_share:.2f}")
     return "\n".join(lines)
