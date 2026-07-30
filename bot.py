@@ -184,6 +184,8 @@ async def handle_payment_message(update: Update, text: str):
     if total_after is not None:
         lines.append(f"Total after chatting: {total_after:.2f}")
         lines.append(f"Ethan share: {ethan_share:.2f}")
+    else:
+        lines.append("No other variables documented \u2014 nothing to calculate.")
 
     await update.message.reply_text("\n".join(lines), message_thread_id=PAYMENTS_THREAD_ID)
 
@@ -390,6 +392,7 @@ def build_monthly_report(month: str) -> str:
 
     lines = []
     total_share = 0.0
+    any_complete = False
     for p in payments:
         lines.append(f"{p['date']}")
         if p.get("note"):
@@ -403,9 +406,15 @@ def build_monthly_report(month: str) -> str:
             lines.append(f"Total after chatting: {p['total_after_chatting']:.2f}")
             lines.append(f"Ethan share: {p['ethan_share']:.2f}")
             total_share += p["ethan_share"]
+            any_complete = True
+        else:
+            lines.append("No other variables documented \u2014 nothing to calculate.")
         lines.append("")
 
-    lines.append(f"Total Ethan share: {total_share:.2f}")
+    if any_complete:
+        lines.append(f"Total Ethan share: {total_share:.2f}")
+    else:
+        lines.append("Total Ethan share: N/A \u2014 no entries this period had both a chatting cost and an amount sent.")
     return "\n".join(lines)
 
 # ---- Scheduled jobs ----
