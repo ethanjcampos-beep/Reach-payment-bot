@@ -1,8 +1,11 @@
 """
 Reach Models Telegram Bot
 - Logs any money-related message posted in the "Models payments" topic
-- Auto-watches the "Expenses" topic (no @ needed) for purchases, matching
-  a later price to an earlier no-price intent message, split 50/50
+- Auto-watches the "Expenses" topic (no @ needed) for purchases — logs them
+  immediately even with no price or date; a split is only calculated when
+  explicitly stated (e.g. specific quantities), never assumed
+- /report shows payments + purchases for a month on demand
+- Posts a purchases summary automatically on the last day of each month
 - Lets you @ the bot anywhere to: log an expense, schedule an expense
   reminder, or ask for a spending report over any date range
 - Posts a monthly payments report automatically on the 1st
@@ -15,6 +18,7 @@ import os
 import json
 import asyncio
 import logging
+import calendar
 from datetime import datetime, timedelta
 from anthropic import Anthropic
 from telegram import Update
@@ -370,10 +374,11 @@ async def handle_expense_thread_message(update: Update, text: str):
         }
         expenses.append(entry)
         save_expenses(expenses)
-        await update.message.reply_text(
-            f"Noted \u2705\n{description}\nI'll log it once you tell me the price.",
-            message_thread_id=thread_id,
-        )
+        reply = ["Purchase logged \u2705", description]
+        if ethan_ratio is not None:
+            reply.append(f"Ethan: {ethan_ratio*100:.0f}% \u2014 Jake: {(1-ethan_ratio)*100:.0f}%")
+        reply.append("No price yet \u2014 add one anytime and I'll calculate the split. Otherwise this'll show up in the monthly summary.")
+        await update.message.reply_text("\n".join(reply), message_thread_id=thread_id)
 
 def build_range_report(start_date: str, end_date: str) -> str:
     payments = load_payments()
@@ -441,8 +446,11 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually trigger a report: /report or /report 2026-07"""
     args = context.args
     month = args[0] if args else datetime.now().strftime("%Y-%m")
-    text = build_monthly_report(month)
-    await update.message.reply_text(text, message_thread_id=PAYMENTS_THREAD_ID)
+    thread_id = update.message.message_thread_id
+    payment_text = build_monthly_report(month)
+    expense_text = build_expense_summary(month)
+    full_text = f"{payment_text}\n\n\U0001F9FE Purchases \u2014 {month}\n\n{expense_text}"
+    await update.message.reply_text(full_text, message_thread_id=thread_id)
 
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove the most recently logged payment entry: /undo, or /undo 3 to remove the last 3"""
@@ -547,6 +555,24 @@ def build_monthly_report(month: str) -> str:
         lines.append("Totals: N/A \u2014 no entries this period had both a chatting cost and an amount sent.")
     return "\n".join(lines)
 
+def build_expense_summary(month: str) -> str:
+    expenses = [e for e in load_expenses() if e["month"] == month]
+    if not expenses:
+        return f"No purchases logged for {month}."
+
+    lines = []
+    for e in expenses:
+        lines.append(e["description"])
+        if e.get("amount") is not None:
+            lines.append(f"Amount: {e['amount']:.2f}")
+            if e.get("ethan_share") is not None:
+                lines.append(f"Ethan's share: {e['ethan_share']:.2f}")
+                lines.append(f"Jake's share: {e['jake_share']:.2f}")
+        else:
+            lines.append("No price logged yet")
+        lines.append("")
+    return "\n".join(lines).strip()
+
 # ---- Scheduled jobs ----
 
 async def send_monthly_report(app: Application):
@@ -576,6 +602,19 @@ async def check_due_reminders(app: Application):
     if changed:
         save_reminders(reminders)
 
+async def check_month_end_expense_summary(app: Application):
+    now = datetime.now()
+    last_day_of_month = calendar.monthrange(now.year, now.month)[1]
+    if now.day != last_day_of_month:
+        return
+    month = now.strftime("%Y-%m")
+    text = build_expense_summary(month)
+    await app.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        message_thread_id=EXPENSES_THREAD_ID,
+        text=f"\U0001F9FE Purchases this month \u2014 {month}\n\n{text}",
+    )
+
 # ---- Main ----
 
 def main():
@@ -589,6 +628,7 @@ def main():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(lambda: asyncio.create_task(send_monthly_report(app)), "cron", day=1, hour=9)
     scheduler.add_job(lambda: asyncio.create_task(check_due_reminders(app)), "cron", hour=9)
+    scheduler.add_job(lambda: asyncio.create_task(check_month_end_expense_summary(app)), "cron", hour=9, minute=30)
     scheduler.start()
 
     logger.info("Bot starting polling...")
