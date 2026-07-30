@@ -309,17 +309,61 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payments = load_payments()
     if not payments:
-        await update.message.reply_text("Nothing to undo \u2014 no entries logged.", message_thread_id=PAYMENTS_THREAD_ID)
+        await update.message.reply_text("Nothing to undo \u2014 no payments logged.", message_thread_id=PAYMENTS_THREAD_ID)
         return
 
     removed = payments[-count:]
     remaining = payments[:-count]
     save_payments(remaining)
 
-    lines = [f"Removed {len(removed)} entry(ies):"]
+    lines = [f"Removed {len(removed)} payment entry(ies):"]
     for entry in removed:
         lines.append(f"- {entry['date']}: chatting cost {entry['chatting_cost']:.2f}, sent {entry['amount_sent']:.2f}")
     await update.message.reply_text("\n".join(lines), message_thread_id=PAYMENTS_THREAD_ID)
+
+async def undo_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove the most recently logged expense: /undo_expense, or /undo_expense 2 for the last 2"""
+    if update.effective_chat.id != GROUP_CHAT_ID:
+        return
+    thread_id = update.message.message_thread_id
+    args = context.args
+    count = int(args[0]) if args and args[0].isdigit() else 1
+
+    expenses = load_expenses()
+    if not expenses:
+        await update.message.reply_text("Nothing to undo \u2014 no expenses logged.", message_thread_id=thread_id)
+        return
+
+    removed = expenses[-count:]
+    remaining = expenses[:-count]
+    save_expenses(remaining)
+
+    lines = [f"Removed {len(removed)} expense(s):"]
+    for entry in removed:
+        lines.append(f"- {entry['description']}: {entry['amount']:.2f}")
+    await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
+
+async def undo_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove the most recently set reminder: /undo_reminder, or /undo_reminder 2 for the last 2"""
+    if update.effective_chat.id != GROUP_CHAT_ID:
+        return
+    thread_id = update.message.message_thread_id
+    args = context.args
+    count = int(args[0]) if args and args[0].isdigit() else 1
+
+    reminders = load_reminders()
+    if not reminders:
+        await update.message.reply_text("Nothing to undo \u2014 no reminders set.", message_thread_id=thread_id)
+        return
+
+    removed = reminders[-count:]
+    remaining = reminders[:-count]
+    save_reminders(remaining)
+
+    lines = [f"Removed {len(removed)} reminder(s):"]
+    for entry in removed:
+        lines.append(f"- {entry['description']} (due {entry['due_date']})")
+    await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
 
 def build_monthly_report(month: str) -> str:
     payments = [p for p in load_payments() if p["month"] == month]
@@ -376,6 +420,8 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("undo", undo_command))
+    app.add_handler(CommandHandler("undo_expense", undo_expense_command))
+    app.add_handler(CommandHandler("undo_reminder", undo_reminder_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
