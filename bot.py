@@ -12,11 +12,15 @@ Setup instructions are in README.md
 import os
 import json
 import asyncio
+import logging
 from datetime import datetime
 from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("reach-bot")
 
 # ---- CONFIG (set these as environment variables on your host) ----
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -62,16 +66,17 @@ Message:
 """
 
 def parse_payment_message(text: str):
-    resp = anthropic.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": PARSE_PROMPT.format(message=text)}],
-    )
-    raw = resp.content[0].text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
     try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": PARSE_PROMPT.format(message=text)}],
+        )
+        raw = resp.content[0].text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except Exception:
+        logger.exception("Failed to parse payment message")
         return None
     if data.get("chatting_cost") is None or data.get("amount_sent") is None:
         return None
@@ -80,15 +85,24 @@ def parse_payment_message(text: str):
 # ---- Telegram handlers ----
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(
+        "Received message: chat_id=%s thread_id=%s text=%r",
+        update.effective_chat.id if update.effective_chat else None,
+        update.message.message_thread_id if update.message else None,
+        update.message.text if update.message else None,
+    )
     if update.effective_chat.id != GROUP_CHAT_ID:
+        logger.info("Ignored: chat_id %s does not match GROUP_CHAT_ID %s", update.effective_chat.id, GROUP_CHAT_ID)
         return
     if update.message.message_thread_id != PAYMENTS_THREAD_ID:
+        logger.info("Ignored: thread_id %s does not match PAYMENTS_THREAD_ID %s", update.message.message_thread_id, PAYMENTS_THREAD_ID)
         return  # only parse payment messages posted in the "Models payments" topic
     text = update.message.text
     if not text:
         return
 
     parsed = parse_payment_message(text)
+    logger.info("Parsed result: %s", parsed)
     if not parsed:
         return  # not a payment message, ignore silently
 
@@ -181,6 +195,7 @@ def main():
     scheduler.add_job(lambda: asyncio.create_task(send_expense_reminder(app)), "cron", day_of_week="mon", hour=9)
     scheduler.start()
 
+    logger.info("Bot starting polling...")
     app.run_polling()
 
 if __name__ == "__main__":
