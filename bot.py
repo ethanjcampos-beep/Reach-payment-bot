@@ -1,6 +1,8 @@
 """
 Reach Models Telegram Bot
-- Logs payment messages posted in the "Models payments" topic
+- Logs any money-related message posted in the "Models payments" topic
+- Auto-watches the "Expenses" topic (no @ needed) for purchases, matching
+  a later price to an earlier no-price intent message, split 50/50
 - Lets you @ the bot anywhere to: log an expense, schedule an expense
   reminder, or ask for a spending report over any date range
 - Posts a monthly payments report automatically on the 1st
@@ -26,7 +28,7 @@ logger = logging.getLogger("reach-bot")
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])  # the Telegram group's chat ID
-COMMISSION_SPLIT = float(os.environ.get("COMMISSION_SPLIT", "0.20"))  # Ethan's 20%
+COMMISSION_SPLIT = float(os.environ.get("COMMISSION_SPLIT", "0.20"))  # Ethan's 20% of payments
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Reachaccountantbot")  # without the @
 
 # Topic (thread) IDs — this group uses Telegram forum topics.
@@ -137,6 +139,51 @@ def classify_mention(text: str):
         logger.exception("Failed to classify mention")
         return None
 
+# ---- Claude parsing: Expenses topic auto-watch (no @ mention needed) ----
+
+CLASSIFY_EXPENSE_PROMPT = """A message was posted in a shared business expenses chat between two partners,
+Ethan and Jake. Determine if it's expense-related and extract details.
+
+Two kinds of expense messages:
+1. Intent/purchase announcement with no price yet, e.g. "Jake is buying 10 X accounts, I'm getting 5 of them"
+   -> description summarizes it, amount is null.
+2. A price being reported, possibly for something mentioned earlier, e.g. "X accounts purchased $350"
+   -> description is the item, amount is the number.
+
+Only extract a split (ethan_ratio) when the message EXPLICITLY states how it's divided between
+the two of them — e.g. quantities ("I'm getting 5 of the 10", "I got 2, Jake got 8"), an explicit
+fraction/percentage, or a directly stated dollar amount for one person. Do NOT assume or default to
+any split (not even 50/50) when the message doesn't say how it's divided — leave ethan_ratio null
+in that case, and it will just be logged as a plain expense with no split.
+
+Return ONLY a JSON object, no other text, no markdown fences:
+{{"is_expense_related": true/false, "description": "<short description or null>", "amount": <number or null>, "ethan_ratio": <fraction 0-1 or null>}}
+
+Examples:
+"Jake is buying 10 X accounts, I'm getting 5 of them" -> ethan_ratio: 0.5 (5 of 10 explicitly stated)
+"We bought 10 X accounts, I only wanted 2 and Jake wanted 8" -> ethan_ratio: 0.2
+"X accounts purchased $350" -> ethan_ratio: null (no division stated)
+"Bought a new laptop for the office, $1200" -> ethan_ratio: null
+
+If the message is clearly unrelated to a purchase/expense (casual chat, a test, banter), return is_expense_related: false.
+
+Message:
+{message}
+"""
+
+def classify_expense_message(text: str):
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": CLASSIFY_EXPENSE_PROMPT.format(message=text)}],
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except Exception:
+        logger.exception("Failed to classify expense message")
+        return None
+
 # ---- Telegram handlers: payment logging (Models payments topic) ----
 
 async def handle_payment_message(update: Update, text: str):
@@ -152,9 +199,11 @@ async def handle_payment_message(update: Update, text: str):
 
     total_after = None
     ethan_share = None
+    jake_share = None
     if chatting_cost is not None and amount_sent is not None:
         total_after = round(amount_sent - chatting_cost, 2)
         ethan_share = round(total_after * COMMISSION_SPLIT, 2)
+        jake_share = round(total_after - ethan_share, 2)
 
     entry = {
         "model": parsed.get("model"),
@@ -163,6 +212,7 @@ async def handle_payment_message(update: Update, text: str):
         "amount_sent": amount_sent,
         "total_after_chatting": total_after,
         "ethan_share": ethan_share,
+        "jake_share": jake_share,
         "note": parsed.get("note"),
         "raw_text": text,
         "logged_at": datetime.now().isoformat(),
@@ -183,7 +233,8 @@ async def handle_payment_message(update: Update, text: str):
         lines.append(f"{sender_label}: {amount_sent:.2f}")
     if total_after is not None:
         lines.append(f"Total after chatting: {total_after:.2f}")
-        lines.append(f"Ethan share: {ethan_share:.2f}")
+        lines.append(f"Ethan's share: {ethan_share:.2f}")
+        lines.append(f"Jake's share: {jake_share:.2f}")
     else:
         lines.append("No other variables documented \u2014 nothing to calculate.")
 
@@ -207,9 +258,13 @@ async def handle_mention(update: Update, text: str):
         if amount is None:
             await update.message.reply_text("I caught the expense but not the amount \u2014 try including a dollar figure.", message_thread_id=thread_id)
             return
+        amount = float(amount)
         entry = {
             "description": description,
-            "amount": float(amount),
+            "amount": amount,
+            "ethan_ratio": None,
+            "ethan_share": None,
+            "jake_share": None,
             "logged_at": datetime.now().isoformat(),
             "month": datetime.now().strftime("%Y-%m"),
         }
@@ -217,7 +272,7 @@ async def handle_mention(update: Update, text: str):
         expenses.append(entry)
         save_expenses(expenses)
         await update.message.reply_text(
-            f"Expense logged \u2705\n{description}: {float(amount):.2f}",
+            f"Expense logged \u2705\n{description}: {amount:.2f}",
             message_thread_id=thread_id,
         )
 
@@ -256,6 +311,70 @@ async def handle_mention(update: Update, text: str):
             message_thread_id=thread_id,
         )
 
+async def handle_expense_thread_message(update: Update, text: str):
+    """Auto-watches the Expenses topic — no @ mention needed. Handles two-step flow:
+    an intent/purchase message with no price yet, followed later by a price message
+    that fills in the most recent pending (price-less) entry. A split is only computed
+    when the message explicitly states how it's divided — never assumed."""
+    thread_id = update.message.message_thread_id
+    classified = classify_expense_message(text)
+    logger.info("Classified expense-thread message: %s", classified)
+    if not classified or not classified.get("is_expense_related"):
+        return  # not expense-related, ignore silently
+
+    description = classified.get("description") or text
+    amount = classified.get("amount")
+    ethan_ratio = classified.get("ethan_ratio")
+    expenses = load_expenses()
+
+    if amount is not None:
+        amount = float(amount)
+        pending = [e for e in expenses if e.get("amount") is None]
+        if pending:
+            entry = pending[-1]
+            entry["amount"] = amount
+            # carry forward a ratio stated earlier if this message doesn't restate one
+            ratio = ethan_ratio if ethan_ratio is not None else entry.get("ethan_ratio")
+            entry["ethan_ratio"] = ratio
+            if ratio is not None:
+                entry["ethan_share"] = round(amount * ratio, 2)
+                entry["jake_share"] = round(amount - entry["ethan_share"], 2)
+            entry["month"] = datetime.now().strftime("%Y-%m")
+        else:
+            entry = {
+                "description": description,
+                "amount": amount,
+                "ethan_ratio": ethan_ratio,
+                "ethan_share": round(amount * ethan_ratio, 2) if ethan_ratio is not None else None,
+                "jake_share": round(amount * (1 - ethan_ratio), 2) if ethan_ratio is not None else None,
+                "logged_at": datetime.now().isoformat(),
+                "month": datetime.now().strftime("%Y-%m"),
+            }
+            expenses.append(entry)
+        save_expenses(expenses)
+
+        lines = ["Expense logged \u2705", entry["description"], f"Amount: {entry['amount']:.2f}"]
+        if entry.get("ethan_share") is not None:
+            lines.append(f"Ethan's share: {entry['ethan_share']:.2f}")
+            lines.append(f"Jake's share: {entry['jake_share']:.2f}")
+        await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
+    else:
+        entry = {
+            "description": description,
+            "amount": None,
+            "ethan_ratio": ethan_ratio,
+            "ethan_share": None,
+            "jake_share": None,
+            "logged_at": datetime.now().isoformat(),
+            "month": datetime.now().strftime("%Y-%m"),
+        }
+        expenses.append(entry)
+        save_expenses(expenses)
+        await update.message.reply_text(
+            f"Noted \u2705\n{description}\nI'll log it once you tell me the price.",
+            message_thread_id=thread_id,
+        )
+
 def build_range_report(start_date: str, end_date: str) -> str:
     payments = load_payments()
     expenses = load_expenses()
@@ -270,15 +389,17 @@ def build_range_report(start_date: str, end_date: str) -> str:
     total_chatting = sum(p["chatting_cost"] for p in p_in_range if p.get("chatting_cost") is not None)
     total_sent = sum(p["amount_sent"] for p in p_in_range if p.get("amount_sent") is not None)
     total_after = sum(p["total_after_chatting"] for p in p_in_range if p.get("total_after_chatting") is not None)
-    total_share = sum(p["ethan_share"] for p in p_in_range if p.get("ethan_share") is not None)
-    total_expenses = sum(e["amount"] for e in e_in_range)
+    total_ethan_share = sum(p["ethan_share"] for p in p_in_range if p.get("ethan_share") is not None)
+    total_jake_share = sum(p["jake_share"] for p in p_in_range if p.get("jake_share") is not None)
+    total_expenses = sum(e["amount"] for e in e_in_range if e.get("amount") is not None)
 
     lines = [f"Report: {start_date} to {end_date}", ""]
     lines.append(f"Payments logged: {len(p_in_range)}")
     lines.append(f"Total chatting cost: {total_chatting:.2f}")
     lines.append(f"Total sent: {total_sent:.2f}")
     lines.append(f"Total after chatting: {total_after:.2f}")
-    lines.append(f"Ethan share: {total_share:.2f}")
+    lines.append(f"Ethan's share: {total_ethan_share:.2f}")
+    lines.append(f"Jake's share: {total_jake_share:.2f}")
     lines.append("")
     lines.append(f"Expenses logged: {len(e_in_range)}")
     lines.append(f"Total expenses: {total_expenses:.2f}")
@@ -303,12 +424,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mentioned = f"@{BOT_USERNAME}".lower() in text.lower()
 
-    if mentioned:
-        await handle_mention(update, text)
+    if update.message.message_thread_id == PAYMENTS_THREAD_ID and not mentioned:
+        await handle_payment_message(update, text)
         return
 
-    if update.message.message_thread_id == PAYMENTS_THREAD_ID:
-        await handle_payment_message(update, text)
+    if update.message.message_thread_id == EXPENSES_THREAD_ID and not mentioned:
+        await handle_expense_thread_message(update, text)
+        return
+
+    if mentioned:
+        await handle_mention(update, text)
 
 # ---- Commands ----
 
@@ -360,7 +485,8 @@ async def undo_expense_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     lines = [f"Removed {len(removed)} expense(s):"]
     for entry in removed:
-        lines.append(f"- {entry['description']}: {entry['amount']:.2f}")
+        amt = f"{entry['amount']:.2f}" if entry.get("amount") is not None else "no price logged yet"
+        lines.append(f"- {entry['description']}: {amt}")
     await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
 
 async def undo_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,7 +517,8 @@ def build_monthly_report(month: str) -> str:
         return f"No payments logged for {month}."
 
     lines = []
-    total_share = 0.0
+    total_ethan_share = 0.0
+    total_jake_share = 0.0
     any_complete = False
     for p in payments:
         lines.append(f"{p['date']}")
@@ -404,17 +531,20 @@ def build_monthly_report(month: str) -> str:
             lines.append(f"{sender}: {p['amount_sent']:.2f}")
         if p.get("total_after_chatting") is not None:
             lines.append(f"Total after chatting: {p['total_after_chatting']:.2f}")
-            lines.append(f"Ethan share: {p['ethan_share']:.2f}")
-            total_share += p["ethan_share"]
+            lines.append(f"Ethan's share: {p['ethan_share']:.2f}")
+            lines.append(f"Jake's share: {p['jake_share']:.2f}")
+            total_ethan_share += p["ethan_share"]
+            total_jake_share += p["jake_share"]
             any_complete = True
         else:
             lines.append("No other variables documented \u2014 nothing to calculate.")
         lines.append("")
 
     if any_complete:
-        lines.append(f"Total Ethan share: {total_share:.2f}")
+        lines.append(f"Total Ethan's share: {total_ethan_share:.2f}")
+        lines.append(f"Total Jake's share: {total_jake_share:.2f}")
     else:
-        lines.append("Total Ethan share: N/A \u2014 no entries this period had both a chatting cost and an amount sent.")
+        lines.append("Totals: N/A \u2014 no entries this period had both a chatting cost and an amount sent.")
     return "\n".join(lines)
 
 # ---- Scheduled jobs ----
