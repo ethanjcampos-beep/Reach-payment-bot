@@ -145,29 +145,17 @@ def classify_mention(text: str):
 
 # ---- Claude parsing: Expenses topic auto-watch (no @ mention needed) ----
 
-CLASSIFY_EXPENSE_PROMPT = """A message was posted in a shared business expenses chat between two partners,
-Ethan and Jake. Determine if it's expense-related and extract details.
+CLASSIFY_EXPENSE_PROMPT = """A message was posted in a shared business expenses chat. Determine if it's
+expense-related and extract details.
 
 Two kinds of expense messages:
-1. Intent/purchase announcement with no price yet, e.g. "Jake is buying 10 X accounts, I'm getting 5 of them"
+1. Intent/purchase announcement with no price yet, e.g. "Jake is buying 10 X accounts"
    -> description summarizes it, amount is null.
 2. A price being reported, possibly for something mentioned earlier, e.g. "X accounts purchased $350"
    -> description is the item, amount is the number.
 
-Only extract a split (ethan_ratio) when the message EXPLICITLY states how it's divided between
-the two of them — e.g. quantities ("I'm getting 5 of the 10", "I got 2, Jake got 8"), an explicit
-fraction/percentage, or a directly stated dollar amount for one person. Do NOT assume or default to
-any split (not even 50/50) when the message doesn't say how it's divided — leave ethan_ratio null
-in that case, and it will just be logged as a plain expense with no split.
-
 Return ONLY a JSON object, no other text, no markdown fences:
-{{"is_expense_related": true/false, "description": "<short description or null>", "amount": <number or null>, "ethan_ratio": <fraction 0-1 or null>}}
-
-Examples:
-"Jake is buying 10 X accounts, I'm getting 5 of them" -> ethan_ratio: 0.5 (5 of 10 explicitly stated)
-"We bought 10 X accounts, I only wanted 2 and Jake wanted 8" -> ethan_ratio: 0.2
-"X accounts purchased $350" -> ethan_ratio: null (no division stated)
-"Bought a new laptop for the office, $1200" -> ethan_ratio: null
+{{"is_expense_related": true/false, "description": "<short description or null>", "amount": <number or null>}}
 
 If the message is clearly unrelated to a purchase/expense (casual chat, a test, banter), return is_expense_related: false.
 
@@ -266,9 +254,6 @@ async def handle_mention(update: Update, text: str):
         entry = {
             "description": description,
             "amount": amount,
-            "ethan_ratio": None,
-            "ethan_share": None,
-            "jake_share": None,
             "logged_at": datetime.now().isoformat(),
             "month": datetime.now().strftime("%Y-%m"),
         }
@@ -318,8 +303,9 @@ async def handle_mention(update: Update, text: str):
 async def handle_expense_thread_message(update: Update, text: str):
     """Auto-watches the Expenses topic — no @ mention needed. Handles two-step flow:
     an intent/purchase message with no price yet, followed later by a price message
-    that fills in the most recent pending (price-less) entry. A split is only computed
-    when the message explicitly states how it's divided — never assumed."""
+    that fills in the most recent pending (price-less) entry. Expenses are just logged
+    as-is — no Ethan's/Jake's share calculation here, that's exclusive to the payments
+    80/20 split in "Models payments"."""
     thread_id = update.message.message_thread_id
     classified = classify_expense_message(text)
     logger.info("Classified expense-thread message: %s", classified)
@@ -328,7 +314,6 @@ async def handle_expense_thread_message(update: Update, text: str):
 
     description = classified.get("description") or text
     amount = classified.get("amount")
-    ethan_ratio = classified.get("ethan_ratio")
     expenses = load_expenses()
 
     if amount is not None:
@@ -337,20 +322,11 @@ async def handle_expense_thread_message(update: Update, text: str):
         if pending:
             entry = pending[-1]
             entry["amount"] = amount
-            # carry forward a ratio stated earlier if this message doesn't restate one
-            ratio = ethan_ratio if ethan_ratio is not None else entry.get("ethan_ratio")
-            entry["ethan_ratio"] = ratio
-            if ratio is not None:
-                entry["ethan_share"] = round(amount * ratio, 2)
-                entry["jake_share"] = round(amount - entry["ethan_share"], 2)
             entry["month"] = datetime.now().strftime("%Y-%m")
         else:
             entry = {
                 "description": description,
                 "amount": amount,
-                "ethan_ratio": ethan_ratio,
-                "ethan_share": round(amount * ethan_ratio, 2) if ethan_ratio is not None else None,
-                "jake_share": round(amount * (1 - ethan_ratio), 2) if ethan_ratio is not None else None,
                 "logged_at": datetime.now().isoformat(),
                 "month": datetime.now().strftime("%Y-%m"),
             }
@@ -358,27 +334,20 @@ async def handle_expense_thread_message(update: Update, text: str):
         save_expenses(expenses)
 
         lines = ["Expense logged \u2705", entry["description"], f"Amount: {entry['amount']:.2f}"]
-        if entry.get("ethan_share") is not None:
-            lines.append(f"Ethan's share: {entry['ethan_share']:.2f}")
-            lines.append(f"Jake's share: {entry['jake_share']:.2f}")
         await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
     else:
         entry = {
             "description": description,
             "amount": None,
-            "ethan_ratio": ethan_ratio,
-            "ethan_share": None,
-            "jake_share": None,
             "logged_at": datetime.now().isoformat(),
             "month": datetime.now().strftime("%Y-%m"),
         }
         expenses.append(entry)
         save_expenses(expenses)
-        reply = ["Purchase logged \u2705", description]
-        if ethan_ratio is not None:
-            reply.append(f"Ethan: {ethan_ratio*100:.0f}% \u2014 Jake: {(1-ethan_ratio)*100:.0f}%")
-        reply.append("No price yet \u2014 add one anytime and I'll calculate the split. Otherwise this'll show up in the monthly summary.")
-        await update.message.reply_text("\n".join(reply), message_thread_id=thread_id)
+        await update.message.reply_text(
+            f"Purchase logged \u2705\n{description}\nNo price yet \u2014 add one anytime, or it'll just show up as-is in the monthly summary.",
+            message_thread_id=thread_id,
+        )
 
 def build_range_report(start_date: str, end_date: str) -> str:
     payments = load_payments()
@@ -565,9 +534,6 @@ def build_expense_summary(month: str) -> str:
         lines.append(e["description"])
         if e.get("amount") is not None:
             lines.append(f"Amount: {e['amount']:.2f}")
-            if e.get("ethan_share") is not None:
-                lines.append(f"Ethan's share: {e['ethan_share']:.2f}")
-                lines.append(f"Jake's share: {e['jake_share']:.2f}")
         else:
             lines.append("No price logged yet")
         lines.append("")
