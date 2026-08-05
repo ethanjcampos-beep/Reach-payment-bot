@@ -1,11 +1,14 @@
 """
 Reach Models Telegram Bot
 - Logs any money-related message posted in the "Models payments" topic
-- Auto-watches the "Expenses" topic (no @ needed) for purchases — logs them
-  immediately even with no price or date; a split is only calculated when
-  explicitly stated (e.g. specific quantities), never assumed
-- /report shows payments + purchases for a month on demand
-- Posts a purchases summary automatically on the last day of each month
+- Auto-watches the "Expenses" topic (no @ needed) for: VA payments to Jerri
+  (always split 50/50), direct debts Ethan owes Jake, and plain purchases
+  (split only when explicitly stated, never assumed). Anything unclear gets
+  logged as the raw message text for manual review instead of guessing.
+- /report shows active (unsettled) payments + expenses for a month on demand
+- /settle clears all currently unsettled expenses from the active report —
+  nothing is ever deleted, everything stays logged in history
+- Posts an active expenses summary automatically on the last day of each month
 - Lets you @ the bot anywhere to: log an expense, schedule an expense
   reminder, or ask for a spending report over any date range
 - Posts a monthly payments report automatically on the 1st
@@ -145,19 +148,29 @@ def classify_mention(text: str):
 
 # ---- Claude parsing: Expenses topic auto-watch (no @ mention needed) ----
 
-CLASSIFY_EXPENSE_PROMPT = """A message was posted in a shared business expenses chat. Determine if it's
-expense-related and extract details.
+CLASSIFY_EXPENSE_PROMPT = """A message was posted in a business "Expenses" chat between two partners,
+Ethan and Jake. This chat tracks: (1) shared purchases/costs (e.g. social media accounts, tools,
+subscriptions), and (2) paying their virtual assistant Jerri for his weekly work. This chat is NEVER
+about paying models or model payouts — that's tracked in a completely separate "Models payments"
+topic. Never invent or use a model's name here, and never describe anything here as a "model payment."
 
-Two kinds of expense messages:
-1. Intent/purchase announcement with no price yet, e.g. "Jake is buying 10 X accounts"
-   -> description summarizes it, amount is null.
-2. A price being reported, possibly for something mentioned earlier, e.g. "X accounts purchased $350"
-   -> description is the item, amount is the number.
+Determine what this message is. Return ONLY a JSON object, no other text, no markdown fences:
+{{"is_expense_related": true/false, "certain": true/false, "category": "<'va_payment'|'debt_to_jake'|'purchase'|'other' or null>", "description": "<short description or null>", "amount": <number or null>}}
 
-Return ONLY a JSON object, no other text, no markdown fences:
-{{"is_expense_related": true/false, "description": "<short description or null>", "amount": <number or null>}}
+Categories:
+- "va_payment": Ethan or Jake paying Jerri (their VA) for his work, e.g. "Jerri pay 144 for this week".
+  This cost is a shared recurring cost split 50/50 between Ethan and Jake automatically.
+- "debt_to_jake": a message stating Ethan owes Jake money directly, not a shared-cost split — e.g.
+  "still need to pay Jake $200 for this", "that payment is from me [to Jake]".
+- "purchase": a purchase or cost, shared or solo (e.g. buying accounts, tools). If the message states
+  it's solely one person's expense (e.g. "(Ethan's expense)"), reflect that in the description, but
+  never compute or assume a split unless explicitly stated.
+- "other": any other clearly expense-related note that doesn't fit the above.
 
-If the message is clearly unrelated to a purchase/expense (casual chat, a test, banter), return is_expense_related: false.
+Set "certain" to false whenever you're not confident about the category, the amount, or what's being
+described — including anything ambiguous or where you'd be guessing. When certain is false, leave
+description and amount null; the raw message gets logged as-is for manual review instead of risking
+a wrong guess.
 
 Message:
 {message}
@@ -254,6 +267,8 @@ async def handle_mention(update: Update, text: str):
         entry = {
             "description": description,
             "amount": amount,
+            "category": "other",
+            "settled": False,
             "logged_at": datetime.now().isoformat(),
             "month": datetime.now().strftime("%Y-%m"),
         }
@@ -301,24 +316,87 @@ async def handle_mention(update: Update, text: str):
         )
 
 async def handle_expense_thread_message(update: Update, text: str):
-    """Auto-watches the Expenses topic — no @ mention needed. Handles two-step flow:
-    an intent/purchase message with no price yet, followed later by a price message
-    that fills in the most recent pending (price-less) entry. Expenses are just logged
-    as-is — no Ethan's/Jake's share calculation here, that's exclusive to the payments
-    80/20 split in "Models payments"."""
+    """Auto-watches the Expenses topic — no @ mention needed. Categorizes into VA payments
+    (always split 50/50), debts owed directly to Jake, or plain purchases (split only when
+    explicitly stated). Anything the model isn't confident about gets logged as the raw
+    message text for manual review, rather than risking a wrong guess."""
     thread_id = update.message.message_thread_id
     classified = classify_expense_message(text)
     logger.info("Classified expense-thread message: %s", classified)
     if not classified or not classified.get("is_expense_related"):
         return  # not expense-related, ignore silently
 
-    description = classified.get("description") or text
-    amount = classified.get("amount")
     expenses = load_expenses()
 
+    if not classified.get("certain", True):
+        entry = {
+            "description": f"\"{text}\"",
+            "amount": None,
+            "category": "raw",
+            "settled": False,
+            "logged_at": datetime.now().isoformat(),
+            "month": datetime.now().strftime("%Y-%m"),
+        }
+        expenses.append(entry)
+        save_expenses(expenses)
+        await update.message.reply_text(
+            f"Logged as-is \u2705 (wasn't sure how to categorize this)\n\"{text}\"\nLet me know if you want this split or categorized differently.",
+            message_thread_id=thread_id,
+        )
+        return
+
+    category = classified.get("category") or "purchase"
+    description = classified.get("description") or text
+    amount = classified.get("amount")
+
+    if category == "va_payment":
+        if amount is None:
+            await update.message.reply_text("Caught that it's a VA payment but not the amount \u2014 try including a dollar figure.", message_thread_id=thread_id)
+            return
+        amount = float(amount)
+        jake_owes_ethan = round(amount / 2, 2)
+        entry = {
+            "description": description,
+            "amount": amount,
+            "category": "va_payment",
+            "jake_owes_ethan": jake_owes_ethan,
+            "settled": False,
+            "logged_at": datetime.now().isoformat(),
+            "month": datetime.now().strftime("%Y-%m"),
+        }
+        expenses.append(entry)
+        save_expenses(expenses)
+        await update.message.reply_text(
+            f"VA payment logged \u2705\n{description}\nAmount: {amount:.2f}\nJake owes Ethan: {jake_owes_ethan:.2f}",
+            message_thread_id=thread_id,
+        )
+        return
+
+    if category == "debt_to_jake":
+        if amount is None:
+            await update.message.reply_text("Caught that Ethan owes Jake but not the amount \u2014 try including a dollar figure.", message_thread_id=thread_id)
+            return
+        amount = float(amount)
+        entry = {
+            "description": description,
+            "amount": amount,
+            "category": "debt_to_jake",
+            "settled": False,
+            "logged_at": datetime.now().isoformat(),
+            "month": datetime.now().strftime("%Y-%m"),
+        }
+        expenses.append(entry)
+        save_expenses(expenses)
+        await update.message.reply_text(
+            f"Debt logged \u2705\nEthan owes Jake: {amount:.2f}\n{description}",
+            message_thread_id=thread_id,
+        )
+        return
+
+    # category is "purchase" or "other" — plain logging, two-step pending-price flow, no assumed split
     if amount is not None:
         amount = float(amount)
-        pending = [e for e in expenses if e.get("amount") is None]
+        pending = [e for e in expenses if e.get("amount") is None and not e.get("settled") and e.get("category") not in ("va_payment", "debt_to_jake", "raw")]
         if pending:
             entry = pending[-1]
             entry["amount"] = amount
@@ -327,18 +405,21 @@ async def handle_expense_thread_message(update: Update, text: str):
             entry = {
                 "description": description,
                 "amount": amount,
+                "category": category,
+                "settled": False,
                 "logged_at": datetime.now().isoformat(),
                 "month": datetime.now().strftime("%Y-%m"),
             }
             expenses.append(entry)
         save_expenses(expenses)
-
         lines = ["Expense logged \u2705", entry["description"], f"Amount: {entry['amount']:.2f}"]
         await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
     else:
         entry = {
             "description": description,
             "amount": None,
+            "category": category,
+            "settled": False,
             "logged_at": datetime.now().isoformat(),
             "month": datetime.now().strftime("%Y-%m"),
         }
@@ -444,7 +525,7 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), message_thread_id=PAYMENTS_THREAD_ID)
 
 async def undo_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove the most recently logged expense: /undo_expense, or /undo_expense 2 for the last 2"""
+    """Remove the most recently logged (unsettled) expense: /undo_expense, or /undo_expense 2 for the last 2"""
     if update.effective_chat.id != GROUP_CHAT_ID:
         return
     thread_id = update.message.message_thread_id
@@ -452,18 +533,46 @@ async def undo_expense_command(update: Update, context: ContextTypes.DEFAULT_TYP
     count = int(args[0]) if args and args[0].isdigit() else 1
 
     expenses = load_expenses()
-    if not expenses:
-        await update.message.reply_text("Nothing to undo \u2014 no expenses logged.", message_thread_id=thread_id)
+    unsettled_idxs = [i for i, e in enumerate(expenses) if not e.get("settled")]
+    if not unsettled_idxs:
+        await update.message.reply_text("Nothing to undo \u2014 no unsettled expenses logged.", message_thread_id=thread_id)
         return
 
-    removed = expenses[-count:]
-    remaining = expenses[:-count]
+    remove_idxs = set(unsettled_idxs[-count:])
+    removed = [expenses[i] for i in sorted(remove_idxs)]
+    remaining = [e for i, e in enumerate(expenses) if i not in remove_idxs]
     save_expenses(remaining)
 
     lines = [f"Removed {len(removed)} expense(s):"]
     for entry in removed:
         amt = f"{entry['amount']:.2f}" if entry.get("amount") is not None else "no price logged yet"
         lines.append(f"- {entry['description']}: {amt}")
+    await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
+
+async def settle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears all currently unsettled expenses from the active report — nothing is deleted,
+    everything stays in history, just marked settled and excluded from /report and the
+    monthly summary going forward."""
+    if update.effective_chat.id != GROUP_CHAT_ID:
+        return
+    thread_id = update.message.message_thread_id
+    expenses = load_expenses()
+    unsettled = [e for e in expenses if not e.get("settled")]
+    if not unsettled:
+        await update.message.reply_text("Nothing to settle \u2014 everything's already cleared.", message_thread_id=thread_id)
+        return
+
+    now_iso = datetime.now().isoformat()
+    for e in expenses:
+        if not e.get("settled"):
+            e["settled"] = True
+            e["settled_at"] = now_iso
+    save_expenses(expenses)
+
+    lines = [f"Settled {len(unsettled)} expense(s) \u2014 cleared from the active report (still saved in history):"]
+    for e in unsettled:
+        amt = f"{e['amount']:.2f}" if e.get("amount") is not None else "no price logged"
+        lines.append(f"- {e['description']}: {amt}")
     await update.message.reply_text("\n".join(lines), message_thread_id=thread_id)
 
 async def undo_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -524,16 +633,22 @@ def build_monthly_report(month: str) -> str:
         lines.append("Totals: N/A \u2014 no entries this period had both a chatting cost and an amount sent.")
     return "\n".join(lines)
 
-def build_expense_summary(month: str) -> str:
+def build_expense_summary(month: str, only_unsettled: bool = True) -> str:
     expenses = [e for e in load_expenses() if e["month"] == month]
+    if only_unsettled:
+        expenses = [e for e in expenses if not e.get("settled")]
     if not expenses:
-        return f"No purchases logged for {month}."
+        return f"No active expenses for {month}." if only_unsettled else f"No expenses logged for {month}."
 
     lines = []
     for e in expenses:
         lines.append(e["description"])
         if e.get("amount") is not None:
             lines.append(f"Amount: {e['amount']:.2f}")
+            if e.get("category") == "va_payment":
+                lines.append(f"Jake owes Ethan: {e['jake_owes_ethan']:.2f}")
+            elif e.get("category") == "debt_to_jake":
+                lines.append("(Ethan owes Jake this amount)")
         else:
             lines.append("No price logged yet")
         lines.append("")
@@ -589,6 +704,7 @@ def main():
     app.add_handler(CommandHandler("undo", undo_command))
     app.add_handler(CommandHandler("undo_expense", undo_expense_command))
     app.add_handler(CommandHandler("undo_reminder", undo_reminder_command))
+    app.add_handler(CommandHandler("settle", settle_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
