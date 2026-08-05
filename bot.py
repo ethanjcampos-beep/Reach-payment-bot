@@ -503,8 +503,15 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(full_text, message_thread_id=thread_id)
 
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove the most recently logged payment entry: /undo, or /undo 3 to remove the last 3"""
+    """Remove the most recently logged payment entry: /undo, or /undo 3 to remove the last 3.
+    Only works in the Models payments topic — use /undo_expense in Expenses."""
     if update.effective_chat.id != GROUP_CHAT_ID:
+        return
+    if update.message.message_thread_id != PAYMENTS_THREAD_ID:
+        await update.message.reply_text(
+            "/undo only removes payment entries and only works in Models payments \u2014 use /undo_expense here instead.",
+            message_thread_id=update.message.message_thread_id,
+        )
         return
     args = context.args
     count = int(args[0]) if args and args[0].isdigit() else 1
