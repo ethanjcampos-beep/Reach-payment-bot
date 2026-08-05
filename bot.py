@@ -42,9 +42,14 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "Reachaccountantbot")  # without t
 PAYMENTS_THREAD_ID = int(os.environ.get("PAYMENTS_THREAD_ID", "4"))  # "Models payments"
 EXPENSES_THREAD_ID = int(os.environ.get("EXPENSES_THREAD_ID", "5"))  # "Expenses"
 
-PAYMENTS_FILE = "payments.json"
-EXPENSES_FILE = "expenses.json"
-REMINDERS_FILE = "reminders.json"
+# DATA_DIR should point at a mounted Railway Volume so this survives redeploys.
+# Without a volume, Railway's filesystem is ephemeral and this data is lost on every redeploy.
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+PAYMENTS_FILE = os.path.join(DATA_DIR, "payments.json")
+EXPENSES_FILE = os.path.join(DATA_DIR, "expenses.json")
+REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
 
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -502,6 +507,14 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = f"{payment_text}\n\n\U0001F9FE Purchases \u2014 {month}\n\n{expense_text}"
     await update.message.reply_text(full_text, message_thread_id=thread_id)
 
+async def expense_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Just the active expenses report, no payments: /expense_report or /expense_report 2026-07"""
+    args = context.args
+    month = args[0] if args else datetime.now().strftime("%Y-%m")
+    thread_id = update.message.message_thread_id
+    text = build_expense_summary(month)
+    await update.message.reply_text(f"\U0001F9FE Expenses \u2014 {month}\n\n{text}", message_thread_id=thread_id)
+
 async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove the most recently logged payment entry: /undo, or /undo 3 to remove the last 3.
     Only works in the Models payments topic — use /undo_expense in Expenses."""
@@ -708,6 +721,7 @@ async def check_month_end_expense_summary(app: Application):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("expense_report", expense_report_command))
     app.add_handler(CommandHandler("undo", undo_command))
     app.add_handler(CommandHandler("undo_expense", undo_expense_command))
     app.add_handler(CommandHandler("undo_reminder", undo_reminder_command))
